@@ -13,15 +13,15 @@ on:
         required: true
         default: "main"
       ksu_branch:
-        description: "SukiSU-Ultra 分支（必须 builtin，不要改成 main/susfs-main）"
+        description: "SukiSU-Ultra 分支（用 main；builtin 上游已损坏，缺 31 个文件）"
         required: true
-        default: "builtin"
+        default: "main"
       susfs:
-        description: "集成 SUSFS（隐藏 root）"
+        description: "集成 SUSFS（main 分支没有 SUSFS 代码，选 true 只会白跑）"
         required: true
         type: choice
-        options: ["true", "false"]
-        default: "true"
+        options: ["false", "true"]
+        default: "false"
       kpm:
         description: "集成 KPM（内核模块，实验性，第一版建议 false）"
         required: true
@@ -167,6 +167,10 @@ jobs:
             echo "CONFIG_KSU=y"
             echo "CONFIG_KSU_DEBUG=n"
             echo "CONFIG_KALLSYMS=y"
+            # main 分支的 KSU 依赖 KPROBES && EXT4_FS；4.19 上 KPROBES 又依赖 MODULES
+            echo "CONFIG_MODULES=y"
+            echo "CONFIG_KPROBES=y"
+            echo "CONFIG_EXT4_FS=y"
             if [ "${{ inputs.susfs }}" = "true" ]; then
               echo "CONFIG_KSU_SUSFS=y"
               echo "CONFIG_KSU_SUSFS_SUS_PATH=y"
@@ -204,10 +208,23 @@ jobs:
           echo "==> drivers/kernelsu 已就位："
           ls -l drivers/ | grep -i kernelsu || true
           ls KernelSU/kernel/Kconfig
-          echo "==> 确认 builtin 分支带 SUSFS 菜单（应看到 KSU_SUSFS）："
-          grep -c "KSU_SUSFS" KernelSU/kernel/Kconfig || true
+          echo "==> 分支完整性自检（上游 builtin 曾被 force-push 破坏，缺 31 个文件）"
+          if [ -f KernelSU/kernel/include/arch.h ]; then
+            echo "OK：kernel/include/arch.h 存在，分支看起来是完整的"
+          else
+            echo ""
+            echo "############################################################"
+            echo "错误：KernelSU/kernel/include/arch.h 不存在 —— 这个分支的源码是坏的！"
+            echo "（上游 builtin 缺少整个 hook 子系统，编译必然失败）"
+            echo "请把 ksu_branch 改成 main 后重跑。"
+            echo "############################################################"
+            exit 1
+          fi
+          echo "==> hook 子系统文件清单："
+          ls KernelSU/kernel/hook/ KernelSU/kernel/hook/arm64/ 2>/dev/null || ls KernelSU/kernel/hook/
 
-      - name: 打 non-GKI hook 补丁（关键步骤）
+      - name: 打 non-GKI hook 补丁（仅 builtin 分支需要；main 用 arm64 运行时内存补丁）
+        if: inputs.ksu_branch == 'builtin'
         run: |
           set -e
           cd $GITHUB_WORKSPACE/kernel
@@ -285,7 +302,7 @@ jobs:
           make $MAKE_ARGS ${{ env.DEFCONFIG }}
 
           echo "==> 本次构建实际生效的关键配置："
-          grep -E "^CONFIG_(KSU|KPM|KALLSYMS|THREAD_INFO_IN_TASK)" out/.config || true
+          grep -E "^CONFIG_(KSU|KPM|KALLSYMS|THREAD_INFO_IN_TASK|KPROBES|MODULES|EXT4_FS)" out/.config || true
           echo "--- 被 Kconfig 丢弃的 KSU 相关项（应为空）---"
           grep -E "^# CONFIG_(KSU|KPM)" out/.config || true
 
@@ -294,9 +311,16 @@ jobs:
             echo ""
             echo "############################################################"
             echo "错误：CONFIG_KSU 没有进入 .config —— 这个内核将完全没有 root。"
-            echo "常见原因：ksu_branch 选错了（必须是 builtin），或 Kconfig 依赖没满足。"
+            echo "最常见原因：CONFIG_KPROBES 没开（main 分支的 KSU 依赖它），或 ksu_branch 选错。"
             echo "############################################################"
             exit 1
+          fi
+          if ! grep -q "^CONFIG_KPROBES=y" out/.config; then
+            echo ""
+            echo "############################################################"
+            echo "警告：CONFIG_KPROBES 没生效。main 分支靠它做 syscall hook，"
+            echo "可能编出来但 root 不工作（多半是 CONFIG_MODULES 没打开）。"
+            echo "############################################################"
           fi
           if [ "${{ inputs.susfs }}" = "true" ] && ! grep -q "^CONFIG_KSU_SUSFS=y" out/.config; then
             echo ""

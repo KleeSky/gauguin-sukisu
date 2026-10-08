@@ -99,8 +99,8 @@ git push -u origin main
 |---|---|---|
 | `kernel_repo` | 默认值不动 | 用 Molyuu 的 neko 树（面向 MIUI，含小米私有相机驱动） |
 | `kernel_branch` | 默认值不动 | `main` |
-| `ksu_branch` | **`builtin`** 千万别改 | 改了就会变成"编译成功但没有 root" |
-| `susfs` | `true` | 隐藏 root，过检测 |
+| `ksu_branch` | **`main`** | ⚠️ **不要用 `builtin`** —— 上游 builtin 分支已被 force-push 破坏（缺 31 个文件，含整个 hook 子系统），编译必失败。workflow 里有 30 秒内失败的预检查 |
+| `susfs` | **`false`** | ⚠️ `main` 分支**完全没有 SUSFS 代码**（零处 `CONFIG_KSU_SUSFS` 引用）。只有坏掉的 builtin 才有。选 `true` 只会白跑一次 |
 | `kpm` | **第一次选 `false`** | 实验性，等第一版确认能开机再加 |
 | `toolchain` | `proton-clang` | 3 个选项，按这个顺序试：`proton-clang` → `aosp-clang15` → `aosp-r383902`。失败一次就换下一个重跑，**不用改文件，只改这个下拉框** |
 
