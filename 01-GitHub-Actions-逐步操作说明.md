@@ -99,8 +99,8 @@ git push -u origin main
 |---|---|---|
 | `kernel_repo` | 默认值不动 | 用 Molyuu 的 neko 树（面向 MIUI，含小米私有相机驱动） |
 | `kernel_branch` | 默认值不动 | `main` |
-| `ksu_ref` | **`v3.2.0`** | ⚠️ 必须是经典 KernelSU 布局的 `v3.2.0`。`main`/`v4.2.0` 是 5.10+ 的新布局，在 4.19 上会报**几百个错**（SELinux 内部结构等），已实测。workflow 里有布局预检查，选错会 30 秒内报错 |
-| `susfs` | **`true`** | v3.2.0 的文件布局正好是 SUSFS 官方 4.19 补丁的目标，**这次 SUSFS 能打上**。如果补丁报 `.rej` 失败，重跑时选 `false` 先拿 root |
+| `ksu_ref` | **`v0.9.5`** | ⚠️ 官方 KernelSU **v0.9.5 是最后一个支持 4.19 的版本**。v1.0.0 起改用 5.1+ 的 SELinux 内部结构（`type_val_to_struct`），你的树里叫 `type_val_to_struct_array` → 必编不过。SukiSU 全部版本都不支持（它是 v1.0 之后才分叉的） |
+| `susfs_commit` | **`d3cf679`** | SUSFS 的 52 个版本里只有 18 个能匹配 v0.9.5（2024-04-24 ~ 2024-10-14），`d3cf679` 是最新的一个，提交说明明确写了 non-gki 支持。**已用 `git apply --check` 本地验证过它能干净打上 v0.9.5** |
 | `kpm` | **第一次选 `false`** | 实验性，等第一版确认能开机再加 |
 | `toolchain` | `proton-clang` | 3 个选项，按这个顺序试：`proton-clang` → `aosp-clang15` → `aosp-r383902`。失败一次就换下一个重跑，**不用改文件，只改这个下拉框** |
 
