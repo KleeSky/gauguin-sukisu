@@ -173,8 +173,11 @@ jobs:
             echo "CONFIG_KSU=y"
             echo "CONFIG_KSU_DEBUG=n"
             echo "CONFIG_KALLSYMS=y"
-            # hook 靠打进内核源码的 #ifdef CONFIG_KSU 分支，所以必须没有 kprobe
-            echo "# CONFIG_KPROBES is not set"
+            # 注意：必须开着 KPROBES！v0.9.5 的 sucompat.c 无条件引用 execve_kp 等
+            # struct kprobe 变量，关掉会直接编译失败。SUSFS 的标准做法是：
+            # KPROBES=y（让声明存在），再把 KSU 源码里的 kprobe 注册代码用 "&& 0" 关掉，
+            # 实际 hook 走打进 fs/*.c 的手工 hook（见下一步的 sed）。
+            echo "CONFIG_KPROBES=y"
             if [ "${{ inputs.susfs }}" = "true" ]; then
               echo "CONFIG_KSU_SUSFS=y"
               echo "CONFIG_KSU_SUSFS_SUS_PATH=y"
@@ -231,6 +234,16 @@ jobs:
             printf '   %-34s %s\n' "$sym" "$([ "$n" -gt 0 ] && echo OK || echo 缺失)"
           done
 
+          echo ""
+          echo "==> 按 SUSFS 官方 README 的做法：保留 kprobe 声明，但关掉 kprobe 注册"
+          before=$(grep -rc '#ifdef CONFIG_KPROBES' KernelSU/kernel 2>/dev/null | awk -F: '{s+=$2} END {print s+0}')
+          find KernelSU/kernel -type f \( -name '*.c' -o -name '*.h' \) -print0 \
+            | xargs -0 sed -i \
+                -e 's/^#ifdef CONFIG_KPROBES$/#if defined(CONFIG_KPROBES) \&\& 0/' \
+                -e 's/^#if defined(CONFIG_KPROBES)$/#if defined(CONFIG_KPROBES) \&\& 0/'
+          after=$(grep -rc 'CONFIG_KPROBES) && 0' KernelSU/kernel 2>/dev/null | awk -F: '{s+=$2} END {print s+0}')
+          echo "   改动前 #ifdef CONFIG_KPROBES 共 $before 处，改动后有 $after 处带 '&& 0'"
+
       - name: 集成 SUSFS（内核侧 + KSU 侧，官方 4.19 补丁）
         if: inputs.susfs == 'true'
         run: |
@@ -244,7 +257,10 @@ jobs:
           echo "==> 1) 复制 SUSFS 源码文件"
           cp -f /tmp/susfs4ksu/kernel_patches/fs/* fs/
           cp -f /tmp/susfs4ksu/kernel_patches/include/linux/* include/linux/
-          ls -l fs/susfs.c fs/sus_su.c include/linux/susfs.h
+          # sus_su.h 里写着 #include "../../drivers/kernelsu/sucompat.h"，
+          # 而 v0.9.5 自身没有这个头文件 —— 必须从 SUSFS 仓库复制过去
+          cp -f /tmp/susfs4ksu/kernel_patches/KernelSU/kernel/sucompat.h KernelSU/kernel/sucompat.h
+          ls -l fs/susfs.c fs/sus_su.c include/linux/susfs.h KernelSU/kernel/sucompat.h
 
           echo ""
           echo "==> 2) 打内核侧补丁 50_add_susfs_in_kernel-4.19.patch"
@@ -275,6 +291,11 @@ jobs:
           if [ -f include/linux/susfs.h ]; then
             grep -m1 "SUSFS_VERSION" include/linux/susfs.h || true
           fi
+
+          echo ""
+          echo "==> 5) 补 android_kabi_reserved* 字段"
+          echo "    （SUSFS 用这些字段存隐藏状态，而它们在 <4.19 普遍缺失 —— SUSFS README 只说'手工补'）"
+          python3 $GITHUB_WORKSPACE/scripts/fix_kabi.py $GITHUB_WORKSPACE/kernel
 
       - name: 打 non-GKI hook 补丁（手工 hook，关键步骤）
         run: |
