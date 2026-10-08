@@ -291,6 +291,35 @@ jobs:
             echo "SUSFS_OK=false" >> $GITHUB_ENV
           fi
 
+      - name: 老内核兼容修补
+        run: |
+          set -e
+          cd $GITHUB_WORKSPACE/kernel
+
+          echo "==> 修补：4.19 缺少 MODULE_IMPORT_NS 宏（该宏 5.4 才引入）"
+          if grep -q "define MODULE_IMPORT_NS" include/linux/module.h; then
+            echo "内核里已经有 MODULE_IMPORT_NS，跳过"
+          else
+            cat >> include/linux/module.h <<'KSUEOF'
+
+/*
+ * Added by the GitHub Actions build for gauguin (Linux 4.19).
+ *
+ * MODULE_IMPORT_NS() only exists since Linux 5.4.  SukiSU/KernelSU uses it
+ * unconditionally in core/init.c, which on 4.19 makes clang parse
+ * "MODULE_IMPORT_NS(FOO);" as a function declaration with an untyped
+ * parameter and fail with:
+ *   error: a parameter list without types is only allowed in a function definition
+ */
+#ifndef MODULE_IMPORT_NS
+#include <linux/stringify.h>
+#define MODULE_IMPORT_NS(ns) MODULE_INFO(import_ns, __stringify(ns))
+#endif
+KSUEOF
+            echo "已注入兼容定义，module.h 尾部："
+            tail -n 6 include/linux/module.h
+          fi
+
       - name: 编译
         run: |
           set -e
@@ -330,9 +359,9 @@ jobs:
             echo "############################################################"
           fi
 
-          echo "==> 开始编译（$(nproc) 线程）"
+          echo "==> 开始编译（$(nproc) 线程，使用 -k 一次暴露所有错误）"
           set -o pipefail
-          make -j"$(nproc --all)" $MAKE_ARGS 2>&1 | tee error.log
+          make -k -j"$(nproc --all)" $MAKE_ARGS 2>&1 | tee error.log
 
           echo "==> 确认 KernelSU 真的被编进去了（防止静默跳过）"
           ls -l out/drivers/kernelsu/ || { echo "!!! out/drivers/kernelsu 不存在，KSU 没参与编译"; exit 1; }
@@ -495,6 +524,12 @@ jobs:
           if [ -f "$LOG" ]; then
             echo "--- error.log 里前 60 条报错 ---"
             grep -nE "error:|fatal error:|Error [0-9]|undefined reference" "$LOG" | head -n 60 || true
+            echo ""
+            echo "--- 去重后的编译错误（这才是真正要修的，前 80 条）---"
+            grep -hE "error:|fatal error:" "$LOG" | sed 's/^[[:space:]]*//' | sort -u | head -n 80 || true
+            echo ""
+            echo "--- 只看 drivers/kernelsu 相关的错误 ---"
+            grep -nE "kernelsu" "$LOG" | grep -E "error:|fatal error:" | head -n 40 || true
             echo ""
             echo "--- error.log 末尾 80 行 ---"
             tail -n 80 "$LOG" || true
