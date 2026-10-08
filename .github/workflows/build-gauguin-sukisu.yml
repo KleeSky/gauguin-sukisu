@@ -1,0 +1,510 @@
+name: Build SukiSU-Ultra kernel for gauguin (Redmi Note 9 Pro 5G / MIUI 14 / A12)
+
+# 用法：仓库页面 -> Actions -> 左侧选这个 workflow -> Run workflow
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_repo:
+        description: "内核源码仓库"
+        required: true
+        default: "https://github.com/Molyuu/neko_kernel_xiaomi_gauguin.git"
+      kernel_branch:
+        description: "内核源码分支"
+        required: true
+        default: "main"
+      ksu_branch:
+        description: "SukiSU-Ultra 分支（必须 builtin，不要改成 main/susfs-main）"
+        required: true
+        default: "builtin"
+      susfs:
+        description: "集成 SUSFS（隐藏 root）"
+        required: true
+        type: choice
+        options: ["true", "false"]
+        default: "true"
+      kpm:
+        description: "集成 KPM（内核模块，实验性，第一版建议 false）"
+        required: true
+        type: choice
+        options: ["false", "true"]
+        default: "false"
+      toolchain:
+        description: "工具链（先试 proton-clang；失败就换 aosp-clang15，再不行 aosp-r383902）"
+        required: true
+        type: choice
+        options: ["proton-clang", "aosp-clang15", "aosp-r383902"]
+        default: "proton-clang"
+
+env:
+  DEFCONFIG: vendor/gauguin_user_defconfig
+  ARCH: arm64
+
+jobs:
+  build:
+    name: 编译 SukiSU-Ultra 内核
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+
+    steps:
+      - name: 拉取本仓库
+        uses: actions/checkout@v4
+
+      - name: 释放磁盘空间
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: false
+
+      - name: 安装编译依赖
+        run: |
+          sudo rm -rf /opt/hostedtoolcache || true
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            git curl wget zip unzip p7zip-full \
+            bc bison flex gperf build-essential \
+            libssl-dev libelf-dev liblz4-tool lzop \
+            device-tree-compiler python3 \
+            cpio rsync
+          df -h /
+
+      - name: 准备工具链
+        run: |
+          set -e
+          cd $GITHUB_WORKSPACE
+          TC=""
+
+          if [ "${{ inputs.toolchain }}" = "proton-clang" ]; then
+            echo "==> 使用 Proton Clang（专为 Qualcomm 老内核准备，自带 aarch64-linux-gnu- / arm-linux-gnueabi-）"
+            rm -rf tc-proton
+            git clone --depth=1 https://github.com/kdrag0n/proton-clang.git tc-proton
+            TC="$GITHUB_WORKSPACE/tc-proton/bin"
+            echo "CROSS=aarch64-linux-gnu-" >> $GITHUB_ENV
+            echo "CROSS_COMPAT=arm-linux-gnueabi-" >> $GITHUB_ENV
+
+          elif [ "${{ inputs.toolchain }}" = "aosp-clang15" ]; then
+            echo "==> 使用 AOSP clang-r458507（clang 15.x —— Neko 内核 defconfig 里记录的编译器就是 clang 15.0.7）"
+            mkdir -p tc15 && cd tc15
+            OK=false
+            for REF in refs/heads/master refs/heads/main master; do
+              echo "--- 尝试 ref: $REF ---"
+              if wget -q --no-check-certificate -O clang.tar.gz \
+                   "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/$REF/clang-r458507.tar.gz" \
+                 && rm -rf clang && mkdir -p clang && tar -xzf clang.tar.gz -C clang \
+                 && [ -x clang/bin/clang ]; then
+                OK=true
+                break
+              fi
+            done
+            if [ "$OK" != "true" ]; then
+              echo "!!! 三种 ref 都没能下载 clang-r458507，请改用 proton-clang 或 aosp-r383902"
+              exit 1
+            fi
+            echo "==> 下载 ARM 官方 GNU 工具链（binutils / 32 位兼容）"
+            wget -q -O gcc64.tar.xz "https://developer.arm.com/-/media/Files/downloads/gnu/14.2.rel1/binrel/arm-gnu-toolchain-14.2.rel1-x86_64-aarch64-none-linux-gnu.tar.xz"
+            rm -rf gcc64 && mkdir -p gcc64 && tar -xf gcc64.tar.xz -C gcc64 --strip-components=1
+            wget -q -O gcc32.tar.xz "https://developer.arm.com/-/media/Files/downloads/gnu/14.2.rel1/binrel/arm-gnu-toolchain-14.2.rel1-x86_64-arm-none-linux-gnueabihf.tar.xz"
+            rm -rf gcc32 && mkdir -p gcc32 && tar -xf gcc32.tar.xz -C gcc32 --strip-components=1
+            TC="$GITHUB_WORKSPACE/tc15/clang/bin:$GITHUB_WORKSPACE/tc15/gcc64/bin:$GITHUB_WORKSPACE/tc15/gcc32/bin"
+            echo "CROSS=aarch64-none-linux-gnu-" >> $GITHUB_ENV
+            echo "CROSS_COMPAT=arm-none-linux-gnueabihf-" >> $GITHUB_ENV
+
+          else
+            echo "==> 使用 AOSP clang-r383902 + AOSP GCC 4.9"
+            mkdir -p tc
+            cd tc
+            wget -q --no-check-certificate -O clang.tar.gz \
+              "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/master/clang-r383902.tar.gz"
+            mkdir -p clang && tar -xzf clang.tar.gz -C clang
+            wget -q --no-check-certificate -O gcc64.tar.gz \
+              "https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9/+archive/refs/heads/master.tar.gz"
+            mkdir -p gcc64 && tar -xzf gcc64.tar.gz -C gcc64
+            wget -q --no-check-certificate -O gcc32.tar.gz \
+              "https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/arm/arm-linux-androideabi-4.9/+archive/refs/heads/master.tar.gz"
+            mkdir -p gcc32 && tar -xzf gcc32.tar.gz -C gcc32
+            TC="$GITHUB_WORKSPACE/tc/clang/bin:$GITHUB_WORKSPACE/tc/gcc64/bin:$GITHUB_WORKSPACE/tc/gcc32/bin"
+            echo "CROSS=aarch64-linux-android-" >> $GITHUB_ENV
+            echo "CROSS_COMPAT=arm-linux-androideabi-" >> $GITHUB_ENV
+          fi
+
+          echo "TC=$TC" >> $GITHUB_ENV
+          echo "CC_ARG=CC=clang" >> $GITHUB_ENV
+
+          echo ""
+          echo "==> 工具链实际版本（这行很重要，出问题时把它发我）："
+          export PATH="$TC:$PATH"
+          clang --version | head -n 3
+          echo "--- 交叉工具链可用性 ---"
+          ${CROSS:-aarch64-linux-gnu-}ld --version 2>/dev/null | head -n 1 || echo "(找不到 ${CROSS}ld)"
+
+      - name: 拉取内核源码
+        run: |
+          set -e
+          cd $GITHUB_WORKSPACE
+          git clone --depth=1 -b "${{ inputs.kernel_branch }}" "${{ inputs.kernel_repo }}" kernel
+          cd kernel
+          echo "==> 内核版本："
+          head -n 5 Makefile | grep -E 'VERSION|PATCHLEVEL|SUBLEVEL'
+          echo "==> defconfig 存在性检查："
+          ls -l arch/arm64/configs/${{ env.DEFCONFIG }}
+
+      - name: 写入需要的 defconfig 开关
+        run: |
+          set -e
+          cd $GITHUB_WORKSPACE/kernel
+          DC=arch/arm64/configs/${{ env.DEFCONFIG }}
+
+          # 备份原始 defconfig，方便对比
+          cp "$DC" "$DC.orig"
+
+          {
+            echo ""
+            echo "# ---- added by GitHub Actions build ----"
+            echo "CONFIG_KSU=y"
+            echo "CONFIG_KSU_DEBUG=n"
+            echo "CONFIG_KALLSYMS=y"
+            if [ "${{ inputs.susfs }}" = "true" ]; then
+              echo "CONFIG_KSU_SUSFS=y"
+              echo "CONFIG_KSU_SUSFS_SUS_PATH=y"
+              echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y"
+              echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y"
+              echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y"
+              echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y"
+              echo "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y"
+              echo "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y"
+              echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y"
+              echo "CONFIG_KSU_SUSFS_SUS_MAP=y"
+              # 兼容较旧 SUSFS 版本的选项名（不认识会被 Kconfig 忽略，无害）
+              echo "CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y"
+              echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y"
+              echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y"
+              echo "CONFIG_KSU_SUSFS_TRY_UMOUNT=y"
+              echo "CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT=y"
+            fi
+            if [ "${{ inputs.kpm }}" = "true" ]; then
+              echo "CONFIG_KPM=y"
+              echo "CONFIG_KALLSYMS_ALL=y"
+            fi
+            echo "# ---- end ----"
+          } >> "$DC"
+
+          echo "==> defconfig 尾部："
+          tail -n 30 "$DC"
+
+      - name: 集成 SukiSU-Ultra
+        run: |
+          set -e
+          cd $GITHUB_WORKSPACE/kernel
+          curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" -o /tmp/ksu-setup.sh
+          bash /tmp/ksu-setup.sh "${{ inputs.ksu_branch }}"
+          echo "==> drivers/kernelsu 已就位："
+          ls -l drivers/ | grep -i kernelsu || true
+          ls KernelSU/kernel/Kconfig
+          echo "==> 确认 builtin 分支带 SUSFS 菜单（应看到 KSU_SUSFS）："
+          grep -c "KSU_SUSFS" KernelSU/kernel/Kconfig || true
+
+      - name: 打 non-GKI hook 补丁（关键步骤）
+        run: |
+          set -e
+          cd $GITHUB_WORKSPACE/kernel
+          mkdir -p /tmp/suki_patch
+          BASE=https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU_patch/main
+          HOOK_FILES="fs/exec.c fs/open.c fs/read_write.c fs/stat.c drivers/input/input.c drivers/tty/pty.c"
+
+          curl -LSs "$BASE/4.19/ksu_hooks_sukisu_4.19.patch" -o /tmp/suki_patch/ksu_hooks.patch
+          wc -l /tmp/suki_patch/ksu_hooks.patch
+
+          echo "===== 方案 A：SukiSU 官方 4.19 + SukiSU 专用 hook 补丁 ====="
+          if patch -p1 --forward < /tmp/suki_patch/ksu_hooks.patch \
+             && ! find . -name '*.rej' -not -path './out/*' | grep -q . ; then
+            echo "==> 方案 A 成功"
+          else
+            echo ""
+            echo "!! 方案 A 有失败块，先完整回滚这几个文件，再改用方案 B"
+            git checkout -- $HOOK_FILES
+            find . -name '*.rej' -not -path './out/*' -delete
+            echo "===== 方案 B：backslashxx 的 syscall hook 补丁脚本（实测支持 4.19）====="
+            curl -LSs "https://raw.githubusercontent.com/JackA1ltman/NonGKI_Kernel_Build/old-v1/Patches/syscall_hook_patches.sh" \
+              -o /tmp/suki_patch/syscall_hook_patches.sh
+            bash /tmp/suki_patch/syscall_hook_patches.sh
+          fi
+
+          echo "==> 校验 hook 确实落进了源码（两套方案都应满足）"
+          grep -n "ksu_handle_execveat" fs/exec.c
+          grep -n "ksu_handle_faccessat" fs/open.c
+          grep -n "ksu_handle_sys_read" fs/read_write.c
+          grep -n "ksu_handle_stat" fs/stat.c
+          grep -n "ksu_handle_input_handle_event" drivers/input/input.c
+          echo "==> hook 补丁应用成功"
+
+      - name: 集成 SUSFS 内核侧代码
+        if: inputs.susfs == 'true'
+        run: |
+          cd $GITHUB_WORKSPACE/kernel
+          git clone --depth=1 -b kernel-4.19 https://github.com/yu13140/susfs4ksu.git /tmp/susfs4ksu
+          BEFORE=$(git diff --name-only | sort)
+          cp -f /tmp/susfs4ksu/kernel_patches/fs/* fs/
+          cp -f /tmp/susfs4ksu/kernel_patches/include/linux/* include/linux/
+          cp -f /tmp/susfs4ksu/kernel_patches/50_add_susfs_in_kernel-4.19.patch ./
+
+          echo "==> 应用 50_add_susfs_in_kernel-4.19.patch"
+          if patch -p1 --forward < 50_add_susfs_in_kernel-4.19.patch \
+             && ! find . -name '*.rej' -not -path './out/*' | grep -q . ; then
+            echo "==> SUSFS 补丁应用成功"
+            ls -l fs/susfs.c include/linux/susfs.h
+          else
+            echo ""
+            echo "############################################################"
+            echo "警告：SUSFS 补丁有失败块（多为版本漂移）。"
+            echo "自动降级：本次构建 = 只有 SukiSU root，不带 SUSFS 隐藏。"
+            echo "内核依然可用，只是隐藏能力没有。"
+            echo "############################################################"
+            # 只回滚 SUSFS 这次改动，保住前面已经打好的 hook 补丁
+            AFTER=$(git diff --name-only | sort)
+            for f in $(comm -13 <(echo "$BEFORE") <(echo "$AFTER")); do
+              git checkout -- "$f" 2>/dev/null || true
+            done
+            find . -name '*.rej' -not -path './out/*' -delete
+            rm -f fs/susfs.c fs/sus_su.c include/linux/susfs.h include/linux/susfs_def.h include/linux/sus_su.h
+            sed -i 's/^CONFIG_KSU_SUSFS/# CONFIG_KSU_SUSFS/' arch/arm64/configs/${{ env.DEFCONFIG }}
+            echo "SUSFS_OK=false" >> $GITHUB_ENV
+          fi
+
+      - name: 编译
+        run: |
+          set -e
+          cd $GITHUB_WORKSPACE/kernel
+          export PATH="${{ env.TC }}:$PATH"
+          MAKE_ARGS="O=out ARCH=${{ env.ARCH }} ${{ env.CC_ARG }} CROSS_COMPILE=${{ env.CROSS }} CROSS_COMPILE_COMPAT=${{ env.CROSS_COMPAT }} CLANG_TRIPLE=aarch64-linux-gnu- OBJDUMP=llvm-objdump"
+
+          echo "==> 生成 .config"
+          make $MAKE_ARGS ${{ env.DEFCONFIG }}
+
+          echo "==> 本次构建实际生效的关键配置："
+          grep -E "^CONFIG_(KSU|KPM|KALLSYMS|THREAD_INFO_IN_TASK)" out/.config || true
+          echo "--- 被 Kconfig 丢弃的 KSU 相关项（应为空）---"
+          grep -E "^# CONFIG_(KSU|KPM)" out/.config || true
+
+          # ---- 快速失败闸门：没有 KSU 就等于编了个没用的内核，别浪费时间往下走 ----
+          if ! grep -q "^CONFIG_KSU=y" out/.config; then
+            echo ""
+            echo "############################################################"
+            echo "错误：CONFIG_KSU 没有进入 .config —— 这个内核将完全没有 root。"
+            echo "常见原因：ksu_branch 选错了（必须是 builtin），或 Kconfig 依赖没满足。"
+            echo "############################################################"
+            exit 1
+          fi
+          if [ "${{ inputs.susfs }}" = "true" ] && ! grep -q "^CONFIG_KSU_SUSFS=y" out/.config; then
+            echo ""
+            echo "############################################################"
+            echo "警告：CONFIG_KSU_SUSFS 没生效（多半是 THREAD_INFO_IN_TASK 未开）。"
+            echo "内核仍会带 root，但 SUSFS 隐藏功能不可用。"
+            echo "############################################################"
+          fi
+
+          echo "==> 开始编译（$(nproc) 线程）"
+          set -o pipefail
+          make -j"$(nproc --all)" $MAKE_ARGS 2>&1 | tee error.log
+
+          echo "==> 确认 KernelSU 真的被编进去了（防止静默跳过）"
+          ls -l out/drivers/kernelsu/ || { echo "!!! out/drivers/kernelsu 不存在，KSU 没参与编译"; exit 1; }
+          if grep -aq "ksu_handle_execveat" out/vmlinux 2>/dev/null; then
+            echo "==> vmlinux 里找到 ksu_handle_execveat 符号 ✓"
+          else
+            echo "!!! vmlinux 里没有 KSU 符号，刷进去可能没有 root"
+          fi
+
+          echo "==> 产物："
+          ls -lh out/arch/arm64/boot/Image out/arch/arm64/boot/dtbo.img || true
+
+      - name: 整理产物（Image / dtb / dtbo.img）
+        run: |
+          set -e
+          cd $GITHUB_WORKSPACE/kernel
+          BOOT=out/arch/arm64/boot
+
+          if [ ! -f "$BOOT/Image" ]; then
+            echo "!!! 没有生成 Image，编译失败。错误摘要："
+            grep -nE "error:|Error [0-9]" error.log | tail -n 60 || true
+            exit 1
+          fi
+
+          echo "==> 拼接 dtb（与该设备原有做法一致：把 qcom 全部 dtb 串成一个 blob）"
+          if [ -d "$BOOT/dts/vendor/qcom" ]; then
+            find "$BOOT/dts/vendor/qcom" -name '*.dtb' -exec cat {} + > "$BOOT/dtb"
+          else
+            find "$BOOT/dts" -name '*.dtb' -exec cat {} + > "$BOOT/dtb"
+          fi
+          ls -lh "$BOOT/dtb" "$BOOT/dtbo.img"
+
+          # ---- 安全闸门：dtb 为空说明没找到 .dtb，刷进去会黑屏，宁可不产出 ----
+          DTB_SIZE=$(stat -c%s "$BOOT/dtb" 2>/dev/null || echo 0)
+          if [ "$DTB_SIZE" -lt 1000 ]; then
+            echo "!!! 拼接出来的 dtb 只有 ${DTB_SIZE} 字节，几乎肯定是没找到 .dtb 文件。"
+            echo "!!! 这种镜像刷进去会黑屏/不开机，所以这里直接终止，不上传不可用的产物。"
+            echo "--- 实际存在的 dtb 文件（供排查）---"
+            find "$BOOT/dts" -name '*.dtb' 2>/dev/null | head -n 20 || true
+            exit 1
+          fi
+          echo "==> dtb 大小正常：${DTB_SIZE} 字节"
+
+          mkdir -p $GITHUB_WORKSPACE/artifacts
+          cp "$BOOT/Image" $GITHUB_WORKSPACE/artifacts/Image
+          cp "$BOOT/dtb" $GITHUB_WORKSPACE/artifacts/dtb
+          if [ -f "$BOOT/dtbo.img" ]; then cp "$BOOT/dtbo.img" $GITHUB_WORKSPACE/artifacts/dtbo.img; fi
+
+      - name: KPM 二进制补丁（实验性）
+        if: inputs.kpm == 'true'
+        run: |
+          set -e
+          cd $GITHUB_WORKSPACE/kernel
+          BOOT=out/arch/arm64/boot
+          curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU_patch/main/kpm/patch_linux" -o "$BOOT/patch"
+          chmod +x "$BOOT/patch"
+          cd "$BOOT"
+          ./patch
+          if [ -f oImage ]; then
+            mv -f oImage Image
+            echo "==> KPM 补丁已应用，Image 已更新"
+          else
+            echo "!!! KPM patcher 没有产出 oImage，KPM 未生效（其余功能不受影响）"
+            exit 1
+          fi
+          cp -f Image $GITHUB_WORKSPACE/artifacts/Image
+          ls -lh Image
+
+      - name: 打包 AnyKernel3 zip
+        run: |
+          set -e
+          cd $GITHUB_WORKSPACE
+          git clone --depth=1 https://github.com/Molyuu/AnyKernel3.git ak3 || \
+            git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git ak3
+          cp -f artifacts/Image ak3/Image
+          cp -f artifacts/dtb   ak3/dtb
+          [ -f artifacts/dtbo.img ] && cp -f artifacts/dtbo.img ak3/dtbo.img || true
+          cd ak3
+          zip -q -r9 "$GITHUB_WORKSPACE/artifacts/gauguin-SukiSU-AnyKernel3.zip" . -x '*.git*'
+          ls -lh $GITHUB_WORKSPACE/artifacts/
+
+      - name: 重打包 boot.img（用于 fastboot 刷入）
+        run: |
+          set -e
+          if [ ! -f "$GITHUB_WORKSPACE/stock/boot.img" ]; then
+            echo "==> 仓库里没有 stock/boot.img，跳过 boot.img 重打包。"
+            echo "==> 你把原厂 boot.img 放到仓库 stock/boot.img 后重跑，就能得到可直接 fastboot 刷入的镜像。"
+            exit 0
+          fi
+
+          cd $GITHUB_WORKSPACE
+          mkdir -p repack && cp stock/boot.img repack/boot.img
+
+          # ---------- 方案 A：AOSP mkbootimg 工具 ----------
+          A_OK=false
+          for BR in main-kernel-build-2024 main master; do
+            rm -rf mkboottools
+            if git clone --depth=1 -b "$BR" \
+                 https://android.googlesource.com/platform/system/tools/mkbootimg.git mkboottools >/dev/null 2>&1; then
+              if [ -f mkboottools/unpack_bootimg.py ] && grep -q -- '--format' mkboottools/unpack_bootimg.py; then
+                echo "==> 方案 A 可用（mkbootimg 分支：$BR）"
+                A_OK=true
+                break
+              fi
+            fi
+          done
+
+          if [ "$A_OK" = "true" ]; then
+            cd $GITHUB_WORKSPACE/repack
+            echo "==> 解包原厂 boot.img"
+            python3 "$GITHUB_WORKSPACE/mkboottools/unpack_bootimg.py" --boot_img boot.img
+            echo "==> 取回重建参数"
+            python3 "$GITHUB_WORKSPACE/mkboottools/unpack_bootimg.py" --boot_img boot.img --format mkbootimg > /tmp/mkboot_args.txt
+            cat /tmp/mkboot_args.txt
+            ls -lh out/
+            echo "==> 替换 kernel 与 dtb"
+            cp -f ../artifacts/Image out/kernel
+            if [ -f out/dtb ]; then
+              cp -f ../artifacts/dtb out/dtb
+            else
+              echo "!! 原厂 boot.img 里没有 dtb 段，保留原样（本设备应有 dtb 段，请留意）"
+            fi
+            echo "==> 重新打包"
+            eval "python3 $GITHUB_WORKSPACE/mkboottools/mkbootimg.py $(cat /tmp/mkboot_args.txt) -o $GITHUB_WORKSPACE/artifacts/boot-new.img"
+          else
+            echo ""
+            echo "==> 方案 A 不可用，改用方案 B：magiskboot"
+            echo "==> （magiskboot 就是 AnyKernel3 在手机上用的同一个工具，行为最接近你以前刷内核的方式）"
+            cd $GITHUB_WORKSPACE
+            APK_URL=$(curl -sL -H "Authorization: Bearer ${{ github.token }}" \
+              https://api.github.com/repos/topjohnwu/Magisk/releases/latest \
+              | grep -o '"browser_download_url": *"[^"]*\.apk"' | head -n1 | sed 's/.*"\(http[^"]*\)".*/\1/')
+            echo "==> Magisk APK: $APK_URL"
+            curl -sL "$APK_URL" -o magisk.apk
+            mkdir -p mbbin
+            unzip -o -j magisk.apk 'lib/x86_64/libmagiskboot.so' -d mbbin
+            mv -f mbbin/libmagiskboot.so mbbin/magiskboot
+            chmod +x mbbin/magiskboot
+            $GITHUB_WORKSPACE/mbbin/magiskboot --help >/dev/null 2>&1 || true
+
+            cd $GITHUB_WORKSPACE/repack
+            $GITHUB_WORKSPACE/mbbin/magiskboot unpack boot.img
+            ls -lh ./
+            echo "==> 替换 kernel 与 dtb"
+            cp -f ../artifacts/Image kernel
+            cp -f ../artifacts/dtb dtb
+            $GITHUB_WORKSPACE/mbbin/magiskboot repack boot.img $GITHUB_WORKSPACE/artifacts/boot-new.img
+          fi
+
+          echo "==> boot.img 重打包完成："
+          ls -lh $GITHUB_WORKSPACE/artifacts/boot-new.img
+
+      - name: 失败诊断（只在上一步失败时运行）
+        if: failure()
+        run: |
+          echo "================ 失败诊断 ================"
+          LOG=$GITHUB_WORKSPACE/kernel/error.log
+          echo "--- 用了哪个工具链 ---"
+          grep -E "工具链实际版本|clang version" -A2 $GITHUB_WORKSPACE/kernel/error.log 2>/dev/null | head -n 5 || true
+          if [ -f "$LOG" ]; then
+            echo "--- error.log 里前 60 条报错 ---"
+            grep -nE "error:|fatal error:|Error [0-9]|undefined reference" "$LOG" | head -n 60 || true
+            echo ""
+            echo "--- error.log 末尾 80 行 ---"
+            tail -n 80 "$LOG" || true
+          else
+            echo "（没有 error.log —— 说明失败发生在编译之前的步骤，请往上看红色那一步的日志）"
+          fi
+          echo ""
+          echo "--- 残留的 .rej 文件 ---"
+          find $GITHUB_WORKSPACE/kernel -name '*.rej' -not -path '*/out/*' 2>/dev/null | head -n 30 || true
+
+      - name: 汇总信息
+        if: always()
+        run: |
+          echo "================ 构建汇总 ================"
+          cd $GITHUB_WORKSPACE/kernel 2>/dev/null || exit 0
+          echo "--- 内核版本 ---"
+          head -n 5 Makefile | grep -E 'VERSION|PATCHLEVEL|SUBLEVEL'
+          echo "--- 生效的 KSU/SUSFS/KPM 配置 ---"
+          grep -E "^CONFIG_(KSU|KPM|KALLSYMS|THREAD_INFO_IN_TASK)" out/.config 2>/dev/null || echo "(没有 out/.config)"
+          echo "--- 残留的 .rej（补丁失败块，应为空）---"
+          find . -name '*.rej' -not -path './out/*' 2>/dev/null | head -n 50 || true
+          echo "--- SUSFS 是否触发降级 ---"
+          echo "SUSFS_OK=${SUSFS_OK:-true}"
+          echo "--- 产物 ---"
+          ls -lh $GITHUB_WORKSPACE/artifacts/ 2>/dev/null || echo "(没有产物)"
+
+      - name: 上传产物
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gauguin-sukisu-build
+          path: |
+            artifacts/
+            kernel/error.log
+            kernel/**/*.rej
+          if-no-files-found: warn
+          retention-days: 14

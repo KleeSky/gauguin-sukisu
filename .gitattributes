@@ -1,0 +1,9 @@
+# 强制仓库内所有文本文件使用 LF 换行。
+# 原因：workflow 的 run: 代码块如果带 CRLF，在 Linux runner 上执行时会报
+#       $'\r': command not found / syntax error 之类的诡异错误。
+# 二进制文件（如 stock/boot.img）由 text=auto 自动识别，不受影响。
+* text=auto eol=lf
+*.png binary
+*.jpg binary
+*.img binary
+*.zip binary
