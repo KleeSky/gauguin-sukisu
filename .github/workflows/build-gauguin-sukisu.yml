@@ -18,9 +18,13 @@ on:
         required: true
         default: "main"
       ksu_ref:
-        description: "SukiSU-Ultra 版本（必须是经典布局的 v3.2.0；不要改成 main）"
+        description: "KernelSU 版本（必须是支持 4.19 的 v0.9.5）"
         required: true
-        default: "v3.2.0"
+        default: "v0.9.5"
+      susfs_commit:
+        description: "SUSFS 版本（必须是能匹配 v0.9.5 的 d3cf679）"
+        required: true
+        default: "d3cf679"
       susfs:
         description: "集成 SUSFS（隐藏 root，官方 4.19 补丁）"
         required: true
@@ -167,11 +171,10 @@ jobs:
             echo ""
             echo "# ---- added by GitHub Actions build ----"
             echo "CONFIG_KSU=y"
-            # 关键：v3.2.0 的 hook 类型是 choice，默认 KSU_KPROBES_HOOK；
-            # 我们不开 kprobe，必须显式选手工 hook，否则三个运行时开关不会生效
-            echo "CONFIG_KSU_MANUAL_HOOK=y"
             echo "CONFIG_KSU_DEBUG=n"
             echo "CONFIG_KALLSYMS=y"
+            # hook 靠打进内核源码的 #ifdef CONFIG_KSU 分支，所以必须没有 kprobe
+            echo "# CONFIG_KPROBES is not set"
             if [ "${{ inputs.susfs }}" = "true" ]; then
               echo "CONFIG_KSU_SUSFS=y"
               echo "CONFIG_KSU_SUSFS_SUS_PATH=y"
@@ -199,35 +202,44 @@ jobs:
           echo "==> defconfig 尾部："
           tail -n 30 "$DC"
 
-      - name: 集成 SukiSU-Ultra（经典布局版本）
+      - name: 集成 KernelSU（官方 v0.9.5，最后一个支持 4.19 的版本）
         run: |
           set -e
           cd $GITHUB_WORKSPACE/kernel
-          curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/${{ inputs.ksu_ref }}/kernel/setup.sh" -o /tmp/ksu-setup.sh
-          echo "==> setup.sh 前 20 行（确认是经典脚本）："
-          head -n 20 /tmp/ksu-setup.sh
+          curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/${{ inputs.ksu_ref }}/kernel/setup.sh" -o /tmp/ksu-setup.sh
           bash /tmp/ksu-setup.sh "${{ inputs.ksu_ref }}"
 
           echo ""
-          echo "==> 版本布局自检（必须同时有 core_hook.c 和 allowlist.c）"
-          if [ -f KernelSU/kernel/core_hook.c ] && [ -f KernelSU/kernel/allowlist.c ]; then
+          echo "==> 布局自检（v0.9.5 必须是经典布局：core_hook.c + allowlist.c + selinux/）"
+          if [ -f KernelSU/kernel/core_hook.c ] && [ -f KernelSU/kernel/allowlist.c ] \
+             && [ -f KernelSU/kernel/selinux/sepolicy.c ]; then
             echo "OK：经典布局确认"
             echo "KernelSU 版本：$(cd KernelSU && git describe --tags 2>/dev/null || git rev-parse --short HEAD)"
           else
             echo ""
             echo "############################################################"
-            echo "错误：SukiSU 目录不是经典布局（缺 core_hook.c 或 allowlist.c）。"
-            echo "说明 ksu_ref 选错了 —— 必须是 v3.2.0（v4.1.3 之后的新布局不支持 4.19）。"
+            echo "错误：KernelSU 目录不是经典布局。"
+            echo "说明 ksu_ref 选错了 —— 必须是 v0.9.5（v1.0.0 起改用 5.1+ SELinux 内部结构，4.19 编不过）。"
             echo "############################################################"
             exit 1
           fi
-          ls KernelSU/kernel/ | head -n 40
+          echo "==> 确认 v0.9.5 提供手工 hook 需要的符号："
+          for sym in ksu_handle_execveat ksu_handle_execveat_sucompat ksu_handle_faccessat \
+                     ksu_vfs_read_hook ksu_handle_sys_read ksu_handle_stat ksu_input_hook \
+                     ksu_handle_input_handle_event ksu_handle_devpts ksu_execveat_hook; do
+            n=$(grep -rl "$sym" KernelSU/kernel --include='*.c' --include='*.h' 2>/dev/null | wc -l)
+            printf '   %-34s %s\n' "$sym" "$([ "$n" -gt 0 ] && echo OK || echo 缺失)"
+          done
 
       - name: 集成 SUSFS（内核侧 + KSU 侧，官方 4.19 补丁）
         if: inputs.susfs == 'true'
         run: |
           cd $GITHUB_WORKSPACE/kernel
-          git clone --depth=1 -b kernel-4.19 https://github.com/yu13140/susfs4ksu.git /tmp/susfs4ksu
+          git clone https://github.com/yu13140/susfs4ksu.git /tmp/susfs4ksu
+          cd /tmp/susfs4ksu
+          git checkout "${{ inputs.susfs_commit }}"
+          echo "SUSFS 版本：$(git log -1 --format='%h %ad' --date=short)"
+          cd $GITHUB_WORKSPACE/kernel
 
           echo "==> 1) 复制 SUSFS 源码文件"
           cp -f /tmp/susfs4ksu/kernel_patches/fs/* fs/
@@ -354,14 +366,12 @@ jobs:
             echo "############################################################"
             exit 1
           fi
-          if ! grep -q "^CONFIG_KSU_MANUAL_HOOK=y" out/.config; then
+          if grep -q "^CONFIG_KPROBES=y" out/.config; then
             echo ""
             echo "############################################################"
-            echo "错误：CONFIG_KSU_MANUAL_HOOK 没生效。"
-            echo "v3.2.0 的 hook 类型是 choice，不开这个就会退回 kprobe 模式，"
-            echo "而我们没有 kprobe 补丁 → 编译出来的内核将没有可用的 hook。"
+            echo "警告：CONFIG_KPROBES 被打开了。v0.9.5 在有 kprobe 时会走 kprobe hook"
+            echo "路径，可能与我们打进去的手工 hook 重复触发。建议保持关闭。"
             echo "############################################################"
-            exit 1
           fi
           if [ "${{ inputs.susfs }}" = "true" ] && ! grep -q "^CONFIG_KSU_SUSFS=y" out/.config; then
             echo ""
@@ -542,10 +552,11 @@ jobs:
           cd $GITHUB_WORKSPACE/kernel 2>/dev/null || exit 0
           echo "--- 内核版本 ---"
           head -n 5 Makefile | grep -E 'VERSION|PATCHLEVEL|SUBLEVEL'
-          echo "--- SukiSU ---"
+          echo "--- KernelSU ---"
           if [ -d KernelSU ]; then
             echo "ref   : $(cd KernelSU && git describe --tags 2>/dev/null || git rev-parse --short HEAD)"
             echo "布局  : $( [ -f KernelSU/kernel/core_hook.c ] && echo 经典布局 || echo 新布局 )"
+            echo "手工hook: fs/exec.c 里 $(grep -c 'ksu_handle_execveat' fs/exec.c 2>/dev/null || echo 0) 处"
           fi
           echo "--- 生效的 KSU/SUSFS/KPM 配置 ---"
           grep -E "^CONFIG_(KSU|KPM|KALLSYMS|THREAD_INFO_IN_TASK|OVERLAY_FS)" out/.config 2>/dev/null || echo "(没有 out/.config)"
