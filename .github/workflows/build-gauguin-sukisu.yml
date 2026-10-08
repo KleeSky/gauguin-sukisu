@@ -300,22 +300,22 @@ jobs:
           if grep -q "define MODULE_IMPORT_NS" include/linux/module.h; then
             echo "内核里已经有 MODULE_IMPORT_NS，跳过"
           else
-            cat >> include/linux/module.h <<'KSUEOF'
-
-/*
- * Added by the GitHub Actions build for gauguin (Linux 4.19).
- *
- * MODULE_IMPORT_NS() only exists since Linux 5.4.  SukiSU/KernelSU uses it
- * unconditionally in core/init.c, which on 4.19 makes clang parse
- * "MODULE_IMPORT_NS(FOO);" as a function declaration with an untyped
- * parameter and fail with:
- *   error: a parameter list without types is only allowed in a function definition
- */
-#ifndef MODULE_IMPORT_NS
-#include <linux/stringify.h>
-#define MODULE_IMPORT_NS(ns) MODULE_INFO(import_ns, __stringify(ns))
-#endif
-KSUEOF
+            {
+              echo ""
+              echo "/*"
+              echo " * Added by the GitHub Actions build for gauguin (Linux 4.19)."
+              echo " *"
+              echo " * MODULE_IMPORT_NS() only exists since Linux 5.4. SukiSU/KernelSU uses it"
+              echo " * unconditionally in core/init.c. On 4.19 clang parses"
+              echo " *   MODULE_IMPORT_NS(FOO);"
+              echo " * as a function declaration with an untyped parameter and fails with:"
+              echo " *   error: a parameter list without types is only allowed in a function definition"
+              echo " */"
+              echo "#ifndef MODULE_IMPORT_NS"
+              echo "#include <linux/stringify.h>"
+              echo "#define MODULE_IMPORT_NS(ns) MODULE_INFO(import_ns, __stringify(ns))"
+              echo "#endif"
+            } >> include/linux/module.h
             echo "已注入兼容定义，module.h 尾部："
             tail -n 6 include/linux/module.h
           fi
